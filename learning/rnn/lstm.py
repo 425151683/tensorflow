@@ -20,6 +20,12 @@ flags.DEFINE_string('data_path', None,
 flags.DEFINE_string('save_path', None, 'Model output directory')
 flags.DEFINE_bool('use_fp16', False, 'Train using 16-bit floats instead of 32bit floats')
 
+# Read the deployment config
+flags.DEFINE_string('ps_hosts', "", 'Comma-separated list of hostname:port pairs')
+flags.DEFINE_string('worker_hosts', "", 'Comma-separated list of hostname:port pairs')
+flags.DEFINE_string("job_name", "", "One of 'ps', 'worker'")
+flags.DEFINE_integer("task_index", 0, "Index of task within the job")
+
 FLAGS = flags.FLAGS
 
 
@@ -246,59 +252,72 @@ def get_config():
 
 
 def main(_):
-    if not FLAGS.data_path:
-        raise ValueError("Must set --data_path to PTB data directory.")
-    raw_data = reader.ptb_raw_data(FLAGS.data_path)
-    train_data, valid_data, test_data, _ = raw_data
+    ps_hosts = FLAGS.ps_hosts.split(",")
+    worker_hosts = FLAGS.worker_hosts.split(",")
 
-    config = get_config()
-    eval_config = get_config()
-    eval_config.batch_size = 1
-    eval_config.num_steps = 1
+    cluster =tf.train.ClusterSpec({"ps": ps_hosts, "worker": worker_hosts})
+    server = tf.train.Server(cluster, job_name=FLAGS.job_name, task_index=FLAGS.task_index)
 
-    with tf.Graph().as_default():
-        initializer = tf.random_uniform_initializer(
-            -config.init_scale, config.init_scale
-        )
+    if FLAGS.job_name == "ps":
+        server.join()
+    elif FLAGS.job_name == "worker":
+        with tf.device(tf.train.replica_device_setter(
+            worker_device="/job:worker/task:%d" % FLAGS.task_index, cluster=cluster
+        )):
 
-        with tf.name_scope("Train"):
-            train_input = PTBInput(config=config, data=train_data, name="TrainInput")
-            with tf.variable_scope("Model", reuse=None, initializer=initializer):
-                m = PTBModel(is_training=True, config=config, input_=train_input)
-            tf.summary.scalar("Training Loss", m.cost)
-            tf.summary.scalar("Learning Rate", m.lr)
+        if not FLAGS.data_path:
+            raise ValueError("Must set --data_path to PTB data directory.")
+        raw_data = reader.ptb_raw_data(FLAGS.data_path)
+        train_data, valid_data, test_data, _ = raw_data
 
-        with tf.name_scope("Valid"):
-            valid_input = PTBInput(config=config, data=valid_data, name="ValidInput")
-            with tf.variable_scope("Model", reuse=True, initializer=initializer):
-                mvalid = PTBModel(is_training=False, config=config, input_=valid_input)
-            tf.summary.scalar("Validation Loss", mvalid.cost)
+        config = get_config()
+        eval_config = get_config()
+        eval_config.batch_size = 1
+        eval_config.num_steps = 1
 
-        with tf.name_scope("Test"):
-            test_input = PTBInput(config=config, data=test_data, name="TestInput")
-            with tf.variable_scope("Model", reuse=True, initializer=initializer):
-                mtest = PTBModel(is_training=False, config=eval_config, input_=test_input)
+        with tf.Graph().as_default():
+            initializer = tf.random_uniform_initializer(
+                -config.init_scale, config.init_scale
+            )
 
-        sv = tf.train.Supervisor(logdir=FLAGS.save_path)
-        with sv.managed_session() as session:
-            for i in range(config.max_max_epoch):
-                lr_decay = config.lr_decay ** max(i + 1 - config.max_epoch, 0.0)
-                m.assign_lr(session, config.learning_rate * lr_decay)
+            with tf.name_scope("Train"):
+                train_input = PTBInput(config=config, data=train_data, name="TrainInput")
+                with tf.variable_scope("Model", reuse=None, initializer=initializer):
+                    m = PTBModel(is_training=True, config=config, input_=train_input)
+                tf.summary.scalar("Training Loss", m.cost)
+                tf.summary.scalar("Learning Rate", m.lr)
 
-                print ("Epoch: %d Learning rate: %.3f" % (i + 1, session.run(m.lr)))
-                train_perplexity = run_epoch(session, m, eval_op=m.train_op, verbose=True)
+            with tf.name_scope("Valid"):
+                valid_input = PTBInput(config=config, data=valid_data, name="ValidInput")
+                with tf.variable_scope("Model", reuse=True, initializer=initializer):
+                    mvalid = PTBModel(is_training=False, config=config, input_=valid_input)
+                tf.summary.scalar("Validation Loss", mvalid.cost)
 
-                print ("Epoch: %d Train Perplexity: %.3f" % (i + 1, train_perplexity))
-                valid_perplexity = run_epoch(session, mvalid)
+            with tf.name_scope("Test"):
+                test_input = PTBInput(config=config, data=test_data, name="TestInput")
+                with tf.variable_scope("Model", reuse=True, initializer=initializer):
+                    mtest = PTBModel(is_training=False, config=eval_config, input_=test_input)
 
-                print ("Epoch: %d Valid Perplexity: %.3f" %(i + 1, valid_perplexity))
+            sv = tf.train.Supervisor(logdir=FLAGS.save_path, is_chief=(FLAGS.task_index == 0))
+            with sv.managed_session(server.target) as session:
+                for i in range(config.max_max_epoch):
+                    lr_decay = config.lr_decay ** max(i + 1 - config.max_epoch, 0.0)
+                    m.assign_lr(session, config.learning_rate * lr_decay)
 
-            test_perplexity = run_epoch(session, mtest)
-            print ("Test Perplexity: %.3f" % test_perplexity)
+                    print ("Epoch: %d Learning rate: %.3f" % (i + 1, session.run(m.lr)))
+                    train_perplexity = run_epoch(session, m, eval_op=m.train_op, verbose=True)
 
-            if FLAGS.save_path:
-                print ("Saving model to %s." %FLAGS.save_path)
-                sv.saver.save(session, FLAGS.save_path, global_step=sv.global_step)
+                    print ("Epoch: %d Train Perplexity: %.3f" % (i + 1, train_perplexity))
+                    valid_perplexity = run_epoch(session, mvalid)
+
+                    print ("Epoch: %d Valid Perplexity: %.3f" %(i + 1, valid_perplexity))
+
+                test_perplexity = run_epoch(session, mtest)
+                print ("Test Perplexity: %.3f" % test_perplexity)
+
+                if FLAGS.save_path:
+                    print ("Saving model to %s." %FLAGS.save_path)
+                    sv.saver.save(session, FLAGS.save_path, global_step=sv.global_step)
 
 if __name__ == "__main__":
     tf.app.run()
